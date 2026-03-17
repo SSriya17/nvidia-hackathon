@@ -1,7 +1,36 @@
 'use client';
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 
 const ACCEPT = '.pdf,.txt';
+
+/** Parse full report text so we always show data even if stream format varied */
+function parseReportFromText(fullText, lines) {
+  const out = { riskScore: null, companyName: '', violations: [], nextSteps: [], supplierText: '', keyIncidentsText: '', topAction: '' };
+  if (!fullText && !lines?.length) return out;
+  const text = fullText || lines.map(l => l.text).join('\n');
+  const riskM = text.match(/(?:risk\s*score|RISK\s*SCORE)[:\s]*(\d+)/i);
+  if (riskM) out.riskScore = parseInt(riskM[1], 10);
+  const companyM = text.match(/(?:company|COMPANY)[:\s]*([^\n]+?)(?:\n|$)/i);
+  if (companyM) out.companyName = companyM[1].trim();
+  const linesOfText = text.split(/\n/).map(s => s.trim()).filter(Boolean);
+  const violationLines = linesOfText.filter(l => /violation|severity:\s*(critical|high|medium)/i.test(l));
+  out.violations = violationLines;
+  const fromStream = (lines || []).filter(l => /violation|severity:\s*(critical|high|medium)/i.test(l.text));
+  if (fromStream.length) out.violations = [...new Set([...out.violations, ...fromStream.map(l => l.text)])];
+  const nextImmediate = text.match(/(?:immediate|NEXT STEPS\s*[—\-]?\s*Immediate)[:\s]*([^\n]+)/i);
+  const next30 = text.match(/(?:30\s*days|NEXT STEPS\s*[—\-]?\s*30)[^\n]*[:\s]*([^\n]+)/i);
+  const next90 = text.match(/(?:90\s*days|NEXT STEPS\s*[—\-]?\s*90)[^\n]*[:\s]*([^\n]+)/i);
+  if (nextImmediate) out.nextSteps.push({ label: 'Immediate', text: nextImmediate[1].trim() });
+  if (next30) out.nextSteps.push({ label: '30 days', text: next30[1].trim() });
+  if (next90) out.nextSteps.push({ label: '90 days', text: next90[1].trim() });
+  const supplierM = text.match(/(?:supplier\s*risks?|SUPPLIER\s*RISKS?)[:\s]*([^\n]+(?:\n(?!\s*[A-Z][a-z]*:)[^\n]*)*)/i);
+  if (supplierM) out.supplierText = supplierM[1].trim();
+  const incidentsM = text.match(/(?:key\s*incidents?|KEY\s*INCIDENTS?)[:\s]*([^\n]+(?:\n(?!\s*[A-Z][a-z]*:)[^\n]*)*)/i);
+  if (incidentsM) out.keyIncidentsText = incidentsM[1].trim();
+  const topM = text.match(/(?:top\s*action|TOP\s*ACTION)[:\s]*([^\n]+)/i);
+  if (topM) out.topAction = topM[1].trim();
+  return out;
+}
 const TRANSITION = 'cubic-bezier(0.4, 0, 0.2, 1)';
 
 const classifyLine = (line) => {
@@ -40,9 +69,21 @@ export default function AMRSentinel() {
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [shareMenuOpen, setShareMenuOpen] = useState(false);
+  const [shareFeedback, setShareFeedback] = useState('');
   const traceRef = useRef(null);
   const lineIdRef = useRef(0);
   const fileInputRef = useRef(null);
+  const shareWrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!shareMenuOpen) return;
+    const close = (e) => {
+      if (shareWrapRef.current && !shareWrapRef.current.contains(e.target)) setShareMenuOpen(false);
+    };
+    document.addEventListener('click', close);
+    return () => document.removeEventListener('click', close);
+  }, [shareMenuOpen]);
 
   useEffect(() => { if (traceRef.current) traceRef.current.scrollTop = traceRef.current.scrollHeight; }, [lines]);
 
@@ -182,15 +223,88 @@ export default function AMRSentinel() {
     setPage(3);
   };
 
-  const violations = lines.filter(l => l.text.startsWith('Violation'));
+  const violations = lines.filter(l => l.text.startsWith('Violation') || /violation|severity:\s*(critical|high|medium)/i.test(l.text));
   const topActionLine = lines.find(l => l.text.startsWith('TOP ACTION'));
   const nextStepsLines = lines.filter(l => /NEXT STEPS\s*[—\-]?\s*(Immediate|30|90)/i.test(l.text));
   const supplierLine = lines.find(l => /SUPPLIER RISKS?/i.test(l.text));
   const keyIncidentsLine = lines.find(l => /KEY INCIDENTS?/i.test(l.text));
 
-  const riskBadge = displayScore != null
-    ? (displayScore >= 70 ? 'RED' : displayScore >= 40 ? 'AMBER' : 'GREEN')
+  const parsedReport = useMemo(() => parseReportFromText(reportFullText, lines), [reportFullText, lines]);
+  const reportRisk = parsedReport.riskScore ?? riskScore ?? displayScore;
+  const reportCompany = parsedReport.companyName || companyName;
+  const reportViolations = parsedReport.violations.length ? parsedReport.violations : violations.map(v => v.text);
+  const reportNextSteps = parsedReport.nextSteps.length ? parsedReport.nextSteps : nextStepsLines.map(l => {
+    const label = /Immediate/i.test(l.text) ? 'Immediate' : /30 days/i.test(l.text) ? '30 days' : '90 days';
+    const text = l.text.replace(/^NEXT STEPS\s*[—\-]?\s*(Immediate|30 days|90 days):?\s*/i, '').trim();
+    return { label, text };
+  });
+  const reportSupplier = parsedReport.supplierText || (supplierLine ? supplierLine.text.replace(/^SUPPLIER RISKS?:\s*/i, '') : '');
+  const reportIncidents = parsedReport.keyIncidentsText || (keyIncidentsLine ? keyIncidentsLine.text.replace(/^KEY INCIDENTS?:\s*/i, '') : '');
+  const reportTopAction = parsedReport.topAction || topActionLine?.text?.replace(/^TOP ACTION:\s*/i, '') || '';
+
+  const riskBadge = reportRisk != null
+    ? (reportRisk >= 70 ? 'RED' : reportRisk >= 40 ? 'AMBER' : 'GREEN')
     : null;
+
+  useEffect(() => {
+    if (page === 3 && parsedReport.riskScore != null && riskScore == null)
+      setRiskScore(parsedReport.riskScore);
+  }, [page, parsedReport.riskScore, riskScore]);
+
+  const buildReportExportText = useCallback(() => {
+    const risk = reportRisk != null ? reportRisk : '--';
+    const company = reportCompany || 'Facility Report';
+    let s = `AMR SENTINEL — Compliance Report\n${'='.repeat(40)}\n\n`;
+    s += `${company}\nRisk Score: ${risk}/100\n\n`;
+    s += `CRITICAL FINDINGS\n${'-'.repeat(24)}\n`;
+    reportViolations.forEach(v => { s += `• ${typeof v === 'string' ? v : v.text}\n`; });
+    if (!reportViolations.length) s += 'None identified\n';
+    s += `\nRECOMMENDED NEXT STEPS\n${'-'.repeat(24)}\n`;
+    reportNextSteps.forEach(step => { s += `• ${step.label}: ${step.text}\n`; });
+    s += `\nSUPPLIER RISK\n${'-'.repeat(24)}\n${reportSupplier || 'None identified'}\n`;
+    s += `\nCOMPLIANCE TIMELINE\n${'-'.repeat(24)}\n${reportIncidents || 'No dated incidents'}\n`;
+    if (reportTopAction) s += `\nTOP ACTION\n${'-'.repeat(24)}\n${reportTopAction}\n`;
+    s += `\n${'='.repeat(40)}\nGenerated by AMR Sentinel`;
+    return s;
+  }, [reportCompany, reportRisk, reportViolations, reportNextSteps, reportSupplier, reportIncidents, reportTopAction]);
+
+  const handleExportDownload = useCallback(() => {
+    const text = buildReportExportText();
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `AMR-Sentinel-Report-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setShareFeedback('Downloaded');
+    setShareMenuOpen(false);
+    setTimeout(() => setShareFeedback(''), 2000);
+  }, [buildReportExportText]);
+
+  const handleCopyReport = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(buildReportExportText());
+      setShareFeedback('Copied to clipboard');
+      setShareMenuOpen(false);
+      setTimeout(() => setShareFeedback(''), 2000);
+    } catch {
+      setShareFeedback('Copy failed');
+      setTimeout(() => setShareFeedback(''), 2000);
+    }
+  }, [buildReportExportText]);
+
+  const handleCopyLink = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(typeof window !== 'undefined' ? window.location.href : '');
+      setShareFeedback('Link copied');
+      setShareMenuOpen(false);
+      setTimeout(() => setShareFeedback(''), 2000);
+    } catch {
+      setShareFeedback('Copy failed');
+      setTimeout(() => setShareFeedback(''), 2000);
+    }
+  }, []);
 
   const sendChat = async () => {
     const msg = chatInput.trim();
@@ -322,24 +436,34 @@ export default function AMRSentinel() {
             </div>
             <div className="report-actions">
               <button type="button" className="glossy-btn secondary" onClick={() => { setPage(1); setFile(null); setFileContents(''); setLines([]); setReportFullText(''); setChatMessages([]); }}>Analyze Another Document</button>
-              <button type="button" className="glossy-btn outline">Export / Share</button>
+              <div className="share-wrap" ref={shareWrapRef}>
+                <button type="button" className="glossy-btn outline" onClick={() => setShareMenuOpen(prev => !prev)} aria-expanded={shareMenuOpen}>Export / Share</button>
+                {shareMenuOpen && (
+                  <div className="share-menu glass">
+                    <button type="button" className="share-menu-item" onClick={handleExportDownload}>Download report (.txt)</button>
+                    <button type="button" className="share-menu-item" onClick={handleCopyReport}>Copy report to clipboard</button>
+                    <button type="button" className="share-menu-item" onClick={handleCopyLink}>Copy link</button>
+                  </div>
+                )}
+                {shareFeedback && <span className="share-feedback">{shareFeedback}</span>}
+              </div>
             </div>
           </div>
           <div className="report-scroll">
             <header className="report-summary glass">
-              <h2 className="report-company">{companyName || 'Facility Report'}</h2>
+              <h2 className="report-company">{reportCompany || 'Facility Report'}</h2>
               <div className="report-badges">
                 {riskBadge && <span className={`severity-pill badge-${riskBadge.toLowerCase()}`}>{riskBadge}</span>}
-                <span className="risk-number">Risk: {displayScore ?? riskScore ?? '--'}/100</span>
+                <span className="risk-number">Risk: {reportRisk != null ? (displayScore ?? reportRisk) : '--'}/100</span>
               </div>
             </header>
 
             <section className="glass report-section">
               <h3 className="section-title">Critical Findings</h3>
-              {violations.length === 0 ? <p className="empty-state">None identified</p> : violations.map((v, i) => (
+              {reportViolations.length === 0 ? <p className="empty-state">None identified</p> : reportViolations.map((v, i) => (
                 <div key={i} className="finding-card">
-                  <span className={`severity-pill ${severityPill(v.text)}`}>{v.text.includes('CRITICAL') ? 'CRITICAL' : v.text.includes('HIGH') ? 'HIGH' : 'MEDIUM'}</span>
-                  <p className="finding-text">{v.text}</p>
+                  <span className={`severity-pill ${severityPill(typeof v === 'string' ? v : v.text)}`}>{typeof v === 'string' ? (v.includes('CRITICAL') ? 'CRITICAL' : v.includes('HIGH') ? 'HIGH' : 'MEDIUM') : (v.text.includes('CRITICAL') ? 'CRITICAL' : v.text.includes('HIGH') ? 'HIGH' : 'MEDIUM')}</span>
+                  <p className="finding-text">{typeof v === 'string' ? v : v.text}</p>
                 </div>
               ))}
             </section>
@@ -347,24 +471,38 @@ export default function AMRSentinel() {
             <section className="glass report-section">
               <h3 className="section-title">Recommended Next Steps</h3>
               <ul className="next-steps-list">
-                {nextStepsLines.length ? nextStepsLines.map((l, i) => (
+                {reportNextSteps.length ? reportNextSteps.map((step, i) => (
                   <li key={i} className="next-step-item">
-                    <span className="next-step-timeline">{/Immediate/i.test(l.text) ? 'Immediate' : /30 days/i.test(l.text) ? '30 days' : '90 days'}</span>
-                    <span>{l.text.replace(/^NEXT STEPS\s*[—\-]?\s*(Immediate|30 days|90 days):?\s*/i, '').trim()}</span>
+                    <span className="next-step-timeline">{step.label || ''}</span>
+                    <span>{step.text ?? ''}</span>
                   </li>
-                )) : (reportFullText && <li className="empty-state">See full report above</li>)}
+                )) : (reportFullText ? <li className="empty-state">See full report below</li> : null)}
               </ul>
             </section>
 
             <section className="glass report-section">
               <h3 className="section-title">Supplier Risk</h3>
-              <p className="section-body">{supplierLine ? supplierLine.text.replace(/^SUPPLIER RISKS?:\s*/i, '') : (reportFullText ? 'None identified' : '—')}</p>
+              <p className="section-body">{reportSupplier || (reportFullText ? 'None identified' : '—')}</p>
             </section>
 
             <section className="glass report-section">
               <h3 className="section-title">Compliance Timeline</h3>
-              <p className="section-body">{keyIncidentsLine ? keyIncidentsLine.text.replace(/^KEY INCIDENTS?:\s*/i, '') : (reportFullText ? 'No dated incidents' : '—')}</p>
+              <p className="section-body">{reportIncidents || (reportFullText ? 'No dated incidents' : '—')}</p>
             </section>
+
+            {reportTopAction && (
+              <section className="glass report-section top-action-section">
+                <h3 className="section-title">Top Priority Action</h3>
+                <p className="section-body top-action-body">{reportTopAction}</p>
+              </section>
+            )}
+
+            {reportFullText && reportRisk == null && reportViolations.length === 0 && (
+              <section className="glass report-section raw-report">
+                <h3 className="section-title">Raw report (no structured data extracted)</h3>
+                <pre className="raw-report-pre">{reportFullText.slice(0, 8000)}</pre>
+              </section>
+            )}
           </div>
 
           {page === 3 && (
